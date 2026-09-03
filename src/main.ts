@@ -1,6 +1,14 @@
 import './style.css';
 import type { SurveyCategory, SurveyDraft, SurveyRecord, NetworkState } from './types/survey';
-import { getDraft, saveDraft, clearDraft, getAllSurveys, deleteSurvey } from './db/surveyDb';
+import { getDraft, saveDraft, clearDraft } from './db/surveyDb';
+import {
+  saveSurvey,
+  fetchSurveys,
+  subscribeSurveys,
+  syncPendingToSupabase,
+  deleteSurveyRecord
+} from './services/surveyService.js';
+import { isSupabaseConfigured } from './supabase.js';
 import { networkService } from './services/networkService';
 import { syncService } from './services/syncService';
 import { capturePhoto, pickPhotoFromGallery } from './services/cameraService';
@@ -91,12 +99,23 @@ async function initApp() {
     console.log('[Draft] Đã khôi phục bản nháp từ IndexedDB');
   }
 
-  // 2. Tải danh sách khảo sát trong IndexedDB
-  appState.surveys = await getAllSurveys();
+  // 2. Lắng nghe dữ liệu khảo sát thời gian thực (Realtime) từ Supabase PostgreSQL
+  subscribeSurveys((updatedSurveys) => {
+    console.log('[App] Dữ liệu khảo sát cập nhật từ Supabase:', updatedSurveys.length);
+    appState.surveys = updatedSurveys;
+    render();
+  });
 
-  // 3. Theo dõi trạng thái mạng
-  networkService.subscribe((state: NetworkState) => {
+  // 3. Theo dõi trạng thái mạng & tự động đồng bộ lên Supabase khi có mạng trở lại
+  networkService.subscribe(async (state: NetworkState) => {
     appState.network = state;
+    if (state.connected) {
+      const syncResult = await syncPendingToSupabase();
+      if (syncResult.synced > 0) {
+        showToast(`⚡ Đã tự động đồng bộ ${syncResult.synced} khảo sát lên Supabase!`);
+      }
+      appState.surveys = await fetchSurveys();
+    }
     render();
   });
 
@@ -104,7 +123,7 @@ async function initApp() {
   syncService.onProgress((total, remaining) => {
     appState.isSyncing = remaining > 0;
     appState.syncProgress = { total, remaining };
-    getAllSurveys().then((list) => {
+    fetchSurveys().then((list) => {
       appState.surveys = list;
       render();
     });
@@ -351,15 +370,15 @@ function renderStepContent(step: number): string {
       </div>
     </div>
 
-    <!-- Banner trạng thái mạng & hành vi đồng bộ -->
+    <!-- Banner trạng thái mạng & hành vi lưu Supabase -->
     <div class="network-alert-box ${appState.network.connected ? 'online' : 'offline'}">
       <div>${appState.network.connected ? '🟢' : '🟠'}</div>
       <div>
         <strong>${appState.network.connected ? 'Thiết bị đang Trực tuyến (Online)' : 'Thiết bị đang Ngoại tuyến (Offline)'}</strong>
         <p style="font-size: 0.8rem; margin-top: 2px;">
           ${appState.network.connected
-            ? 'Khảo sát sẽ được gửi ngay lập tức lên hệ thống lưu trữ VKU.'
-            : 'Khảo sát sẽ được lưu an toàn vào IndexedDB với trạng thái PENDING_SYNC và tự động đồng bộ tuần tự khi có mạng trở lại.'
+            ? 'Khảo sát sẽ được gửi trực tiếp lên máy chủ cơ sở dữ liệu PostgreSQL (Supabase).'
+            : 'Khảo sát sẽ được lưu an toàn vào IndexedDB với trạng thái PENDING_SYNC và tự động đồng bộ lên Supabase khi có mạng trở lại.'
           }
         </p>
       </div>
@@ -394,6 +413,17 @@ function renderQueueTab(): string {
           🔄 Đồng bộ ngay
         `}
       </button>
+    </div>
+
+    <!-- Thanh trạng thái kết nối Supabase -->
+    <div style="margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; background: var(--gray-100); padding: 8px 12px; border-radius: var(--radius-sm); font-size: 0.78rem;">
+      <span style="display: flex; align-items: center; gap: 6px;">
+        <span>🐘 Cơ sở dữ liệu:</span>
+        <strong>PostgreSQL (Supabase)</strong>
+      </span>
+      <span style="color: ${isSupabaseConfigured ? 'var(--success)' : 'var(--warning)'}; font-weight: 600;">
+        ${isSupabaseConfigured ? '🟢 Realtime Đang kết nối' : '🟠 Ngoại tuyến (Chờ cấu hình .env)'}
+      </span>
     </div>
 
     ${appState.isSyncing ? `
@@ -474,7 +504,7 @@ function renderDetailModal(s: SurveyRecord): string {
   const statusLabels: Record<string, string> = {
     PENDING_SYNC: '⏳ Chờ đồng bộ (Offline Queue)',
     SYNCING: '🔄 Đang đồng bộ dữ liệu...',
-    SYNCED: '✅ Đã đồng bộ thành công',
+    SYNCED: '✅ Đã lưu PostgreSQL (Supabase)',
     FAILED: '❌ Đồng bộ thất bại'
   };
 
@@ -485,7 +515,7 @@ function renderDetailModal(s: SurveyRecord): string {
 
   const syncedDateStr = s.syncedAt
     ? new Date(s.syncedAt).toLocaleString('vi-VN', { dateStyle: 'medium', timeStyle: 'medium' })
-    : 'Chưa đồng bộ (Đang lưu trong IndexedDB)';
+    : 'Chưa đồng bộ lên Supabase (Đang lưu IndexedDB)';
 
   // Tính dung lượng tổng các ảnh Base64
   const totalPhotoBytes = s.photos.reduce((acc, p) => acc + Math.round((p.length * 3) / 4), 0);
@@ -594,11 +624,11 @@ function renderDetailModal(s: SurveyRecord): string {
               </div>
               <div class="spec-row">
                 <span class="spec-key">Cơ sở dữ liệu lưu trữ:</span>
-                <span class="spec-value">IndexedDB (Store: surveys)</span>
+                <span class="spec-value">PostgreSQL (Supabase) & IndexedDB</span>
               </div>
               <div class="spec-row">
                 <span class="spec-key">Nền tảng ứng dụng:</span>
-                <span class="spec-value">VKU Field Survey PWA Standalone</span>
+                <span class="spec-value">VKU Field Survey PWA / Android Native</span>
               </div>
               <div class="spec-row">
                 <span class="spec-key">Dung lượng ảnh Base64:</span>
@@ -616,7 +646,7 @@ function renderDetailModal(s: SurveyRecord): string {
 
         <!-- Footer Modal -->
         <div class="modal-footer">
-          <button class="btn-delete-survey" id="btn-delete-survey" title="Xóa vĩnh viễn phiếu khảo sát này khỏi máy">
+          <button class="btn-delete-survey" id="btn-delete-survey" title="Xóa vĩnh viễn phiếu khảo sát này khỏi máy và server">
             🗑️ Xóa phiếu
           </button>
           <div class="modal-footer-actions">
@@ -746,7 +776,7 @@ function attachEventListeners() {
     }
   });
 
-  // Xóa phiếu khảo sát khỏi IndexedDB
+  // Xóa phiếu khảo sát khỏi IndexedDB và Supabase
   document.querySelector('#btn-delete-survey')?.addEventListener('click', async () => {
     const selected = appState.surveys.find((s) => s.id === appState.selectedSurveyId);
     if (!selected) return;
@@ -755,9 +785,9 @@ function attachEventListeners() {
       `Bạn có chắc chắn muốn xóa vĩnh viễn phiếu khảo sát "${selected.building} - Phòng ${selected.roomNumber || 'Chung'}" không?`
     );
     if (confirmDelete) {
-      await deleteSurvey(selected.id);
+      await deleteSurveyRecord(selected.id);
       appState.selectedSurveyId = null;
-      appState.surveys = await getAllSurveys();
+      appState.surveys = await fetchSurveys();
       showToast('🗑️ Đã xóa phiếu khảo sát.');
       render();
     }
@@ -899,27 +929,27 @@ function attachEventListeners() {
     render();
   });
 
-  // Nút Gửi Khảo Sát Hoàn Tất
+  // Nút Gửi Khảo Sát Hoàn Tất -> Sử dụng saveSurvey từ surveyService
   document.querySelector('#btn-submit-survey')?.addEventListener('click', async () => {
     const btn = document.querySelector<HTMLButtonElement>('#btn-submit-survey');
     if (btn) btn.disabled = true;
 
     try {
-      // Gửi vào hàng chờ / sync service
-      await syncService.submitSurvey(appState.draft);
+      // 1. Lưu dữ liệu khảo sát vào PostgreSQL (Supabase) hoặc IndexedDB nếu offline
+      const savedRecord = await saveSurvey(appState.draft);
 
-      // Xóa nháp sau khi gửi thành công
+      // 2. Xóa bản nháp sau khi gửi thành công
       await clearDraft();
       appState.draft = { ...defaultDraft, step: 1 };
       appState.hasDraftNotice = false;
 
-      // Cập nhật lại danh sách khảo sát
-      appState.surveys = await getAllSurveys();
+      // 3. Cập nhật lại danh sách khảo sát mới nhất
+      appState.surveys = await fetchSurveys();
 
-      if (appState.network.connected) {
-        showToast('🎉 Đã gửi khảo sát và đồng bộ thành công!');
+      if (savedRecord.status === 'SYNCED') {
+        showToast('🎉 Đã lưu khảo sát lên PostgreSQL (Supabase) thành công!');
       } else {
-        showToast('📦 Đang offline. Khảo sát đã được lưu vào hàng chờ PENDING_SYNC!');
+        showToast('📦 Đang offline. Khảo sát đã được lưu vào IndexedDB và sẽ tự động đồng bộ lên Supabase!');
       }
 
       // Tự động chuyển sang tab Hàng chờ để người dùng theo dõi
@@ -938,9 +968,11 @@ function attachEventListeners() {
       showToast('⚠️ Thiết bị chưa có kết nối mạng.');
       return;
     }
-    showToast('Đang tiến hành đồng bộ các khảo sát trong hàng chờ...');
+    showToast('Đang tiến hành đồng bộ các khảo sát lên Supabase PostgreSQL...');
+    await syncPendingToSupabase();
     await syncService.syncAll();
-    appState.surveys = await getAllSurveys();
+    appState.surveys = await fetchSurveys();
+    showToast('✅ Đã đồng bộ hoàn tất!');
     render();
   });
 }
